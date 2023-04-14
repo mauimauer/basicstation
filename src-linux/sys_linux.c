@@ -1,6 +1,6 @@
 /*
  * --- Revised 3-Clause BSD License ---
- * Copyright Semtech Corporation 2020. All rights reserved.
+ * Copyright Semtech Corporation 2022. All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without modification,
  * are permitted provided that the following conditions are met:
@@ -50,6 +50,8 @@
 #include "sys_linux.h"
 #include "fs.h"
 #include "selftests.h"
+
+#include "mbedtls/version.h"
 
 extern char* makeFilepath (const char* prefix, const char* suffix, char** pCachedFile, int isReadable); // sys.c
 extern int writeFile (str_t file, const char* data, int datalen);
@@ -119,23 +121,33 @@ static void handle_signal (int signum) {
 
 static int updateDirSetting (str_t path, str_t source, str_t* pdir, str_t* psrc) {
     int l = strlen(path);
-    char* p = rt_mallocN(char, l+3);
-    if( l == 0 ) {
-        strcpy(p, "./");
+    char* p = rt_mallocN(char, l+5);  // more space for optional "./" and/or "/" + "\0"
+    if( path[0] ) {
+        strcpy(p,path);
     } else {
-        struct stat st;
-        if( stat(path, &st) == -1 ) {
-            fprintf(stderr, "%s - Cannot access directory '%s': %s\n", source, path, strerror(errno));
-            return 0;
-        }
-        if( !S_ISDIR(st.st_mode) ) {
-            fprintf(stderr, "%s - Not a directory: %s\n", source, path);
-            return 0;
-        }
-        strcpy(p, path);
-        if( l>0 && p[l-1] != '/' )
-            p[l] = '/';
+        strcpy(p,"./");
+        l = 2;
     }
+    if( p[l-1] != '/' ) {
+        p[l++] = '/';
+    }
+    if( p[0] != '/' && (p[0] != '.' || p[1] != '/') ) {
+        memmove(p+2, p, l+1);
+        p[0] = '.';
+        p[1] = '/';
+    }
+    struct stat st;
+    if( stat(p, &st) == -1 ) {
+        fprintf(stderr, "%s - Cannot access directory '%s': %s\n", source, p, strerror(errno));
+        goto err;
+    }
+    if( !S_ISDIR(st.st_mode) ) {
+        fprintf(stderr, "%s - Not a directory: %s\n", source, p);
+  err:
+        rt_free(p);
+        return 0;
+    }
+
     rt_free((void*)*pdir);
     rt_free((void*)*psrc);
     *pdir = p;
@@ -204,12 +216,9 @@ static void findDefaultEui () {
         if( ifc[0] != 0 ) {
             if( strncmp(ifc, "eth", 3) == 0 && strncmp(dname, "eth", 3) != 0 )
                 continue; // eth trumps other devices
-            // in case there is no eth0
-            if( strncmp(ifc, "wla", 3) == 0 && strncmp(dname, "wla", 3) != 0 )
-                continue; // wlan trumps other devices
             // Otherwie choose alphabetically lowest - unless eth replaces something else
             if( !((strncmp(ifc, "eth", 3) == 0) ^ (strncmp(dname, "eth", 3) == 0))
-                && strcmp(ifc, dname) > 0 )
+                && strcmp(ifc, dname) <= 0 )
                 continue; // not lower
         }
         strcpy(ifc, dname);
@@ -222,7 +231,6 @@ static void findDefaultEui () {
         protoEUI = eui;
         rt_free((void*)protoEuiSrc);
         protoEuiSrc = rt_strdup(path);
-        LOG(MOD_SYS|INFO, "findDefaultEui -> protoEuiSrc %s - protoEUI %lu", protoEuiSrc, protoEUI);
     }
 }
 
@@ -302,10 +310,26 @@ int sys_findPids (str_t device, u4_t* pids, int n_pids) {
 }
 
 
-str_t sys_radioDevice (str_t device) {
+str_t sys_radioDevice (str_t device, u1_t* comtype) {
     str_t f = device==NULL ? radioDevice : device;
     if( f == NULL )
         f = RADIODEV;
+    // check for comtype prefix
+    if( comtype )
+	*comtype = COMTYPE_SPI;
+    char *colon = index(f, ':');
+    if( colon ) {
+	if( strncmp(f, "spi:", 4) == 0 ) {
+	    if( comtype )
+		*comtype = COMTYPE_SPI;
+	} else if( strncmp(f, "usb:", 4) == 0 ) {
+	    if( comtype )
+		*comtype = COMTYPE_USB;
+	} else {
+	    LOG(MOD_SYS|ERROR, "Unknown device comtype '%.*s' (using SPI)", colon-f, f);
+	}
+	f = colon + 1;
+    }
     // Caller must free result
     return sys_makeFilepath(f, 0);
 }
@@ -370,7 +394,8 @@ void sys_ini () {
         logfile.path==NULL ? "stderr" : logfile.path, logfile.size, logfile.rotate);
     LOG(MOD_SYS|INFO, "Station Ver : %s",  CFG_version " " CFG_bdate);
     LOG(MOD_SYS|INFO, "Package Ver : %s",  sys_version());
-    LOG(MOD_SYS|INFO, "proto EUI(x) : %:E\t(%s)", protoEUI, protoEuiSrc);
+    LOG(MOD_SYS|INFO, "mbedTLS Ver : %s",  MBEDTLS_VERSION_STRING);
+    LOG(MOD_SYS|INFO, "proto EUI   : %:E\t(%s)", protoEUI, protoEuiSrc);
     LOG(MOD_SYS|INFO, "prefix EUI  : %:E\t(%s)", prefixEUI, prefixEuiSrc);
     LOG(MOD_SYS|INFO, "Station EUI : %:E", sys_eui());
     LOG(MOD_SYS|INFO, "Station home: %s\t(%s)",  homeDir, homeDirSrc);
@@ -531,7 +556,7 @@ int sys_execCommand (ustime_t max_wait, str_t* argv) {
         if( max_wait!=0 || (pid2 = fork()) == 0 ) {
             if( access(argv[0], X_OK) != 0 ) {
                 // Not an executable file
-                str_t* argv2 = rt_mallocN(str_t, argc+3);
+                str_t* argv2 = rt_mallocN(str_t, argc+4);
                 memcpy(&argv2[3], &argv[0], sizeof(argv[0])*(argc+1)); // also copy trailing NULL
                 if( access(argv[0], F_OK) == -1 ) {
                     // Not even a file - assume shell statements
@@ -548,13 +573,16 @@ int sys_execCommand (ustime_t max_wait, str_t* argv) {
             }
             for( int i=0; argv[i]; i++ )
                 LOG(MOD_SYS|DEBUG, "%s argv[%d]: <%s>\n", i==0?"execvp":"      ", i, argv[i]);
+            log_flushIO();
 
             if( execvp(argv[0], (char*const*)argv) == -1 ) {
                 LOG(MOD_SYS|ERROR, "%s: Failed to exec: %s", argv[0], strerror(errno));
+                log_flushIO();
                 exit(9);
             }
         } else if( pid2 < 0 ) {
             LOG(MOD_SYS|ERROR, "%s: Fork(2) failed: %s", argv[0], strerror(errno));
+            log_flushIO();
             exit(8);
         }
         exit(0);
@@ -969,9 +997,9 @@ static int parse_opt (int key, char* arg, struct argp_state* state) {
         return 0;
     }
     case 'v': {
-        fputs("Station: " CFG_version " " CFG_bdate "\n", stderr);
+        fputs("Station: " CFG_version " " CFG_bdate "\n", stdout);
         readFileAsString("version", ".txt", &versionTxt);
-        fprintf(stderr, "Package: %s\n", versionTxt);
+        fprintf(stdout, "Package: %s\n", versionTxt);
         exit(0);
     }
     case ARGP_KEY_END: {
